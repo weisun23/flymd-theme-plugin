@@ -115,7 +115,7 @@ function buildHeaderComment(meta) {
 
 function parseGithubInput(input) {
   if (!input) return null
-  const s = String(input).trim()
+  const s = String(input).trim().replace(/#.*$/, '').replace(/\?.*$/, '').replace(/\/+$/, '')
 
   // 完整 https://github.com/.../blob/branch/path/file.ext
   let m = s.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+)$/i)
@@ -131,6 +131,10 @@ function parseGithubInput(input) {
   // 完整 https://github.com/owner/repo[/...] 或 git@github.com:owner/repo
   m = s.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?(?:\/.*)?$/i)
   if (m) return { owner: m[1], repo: m[2], branch: '', path: '' }
+
+  // owner/repo/path 或 owner/repo/path@branch（子目录主题）
+  m = s.match(/^([^\s/@]+)\/([^\s/@]+)\/([^\s@]+?)(?:@([^\s]+))?$/)
+  if (m) return { owner: m[1], repo: m[2], branch: m[4] || '', path: m[3] }
 
   // owner/repo 或 owner/repo@branch
   m = s.match(/^([^\s/@]+)\/([^\s/@]+)(?:@([^\s/]+))?$/)
@@ -151,11 +155,19 @@ function rawUrl(g, path, branch) {
 async function fetchText(url) {
   if (!CTX || !CTX.http) throw new Error('http API 不可用')
   const resp = await CTX.http.fetch(url, { method: 'GET' })
-  if (!resp || !resp.ok) {
-    const code = resp ? resp.status : 'no-response'
-    throw new Error('HTTP ' + code + ' @ ' + url)
+  if (!resp) throw new Error('HTTP no-response @ ' + url)
+
+  const status = resp.status || resp.statusCode || 0
+  const ok = resp.ok !== undefined ? resp.ok : (status >= 200 && status < 300)
+  if (!ok) throw new Error('HTTP ' + status + ' @ ' + url)
+
+  if (typeof resp.text === 'function') return await resp.text()
+  if (typeof resp.data === 'string') return resp.data
+  if (typeof resp.body === 'string') return resp.body
+  if (resp.data && (resp.data instanceof ArrayBuffer || (resp.data.buffer instanceof ArrayBuffer))) {
+    return new TextDecoder('utf-8').decode(resp.data)
   }
-  return await resp.text()
+  throw new Error('无法从响应中提取文本内容')
 }
 
 async function fetchTextOrNull(url) {
@@ -687,6 +699,12 @@ async function uninstallTheme(id) {
 
 async function installFromUrl(url) {
   if (!url) throw new Error('URL 为空')
+
+  // GitHub 页面 URL 自动路由到 GitHub 安装逻辑
+  if (/^https?:\/\/github\.com\//i.test(url)) {
+    return await installFromGithub(url)
+  }
+
   const lower = url.toLowerCase()
 
   // 如果 URL 以 .json 结尾或包含 theme.json：先按 manifest 处理
@@ -713,9 +731,13 @@ async function installFromGithub(input) {
 
   const branches = g.branch ? [g.branch] : ['main', 'master']
 
-  // 1) 尝试 theme.json（在用户给定的 path 或根目录）
-  const jsonPath = g.path && /\.json($|\?)/i.test(g.path) ? g.path : 'theme.json'
-  let r = await fetchFromBranches(g, jsonPath, branches)
+  // 有明确子路径时，从该子目录安装
+  if (g.path) {
+    return await installFromGithubPath(g, branches)
+  }
+
+  // 1) 尝试根目录 theme.json
+  let r = await fetchFromBranches(g, 'theme.json', branches)
   if (r) {
     let manifest
     try { manifest = JSON.parse(r.text) } catch (e) { throw new Error('theme.json 解析失败：' + e.message) }
@@ -729,12 +751,8 @@ async function installFromGithub(input) {
     })
   }
 
-  // 2) 回退到 css 文件
-  const cssCandidates = g.path && /\.css($|\?)/i.test(g.path)
-    ? [g.path]
-    : ['theme.css', 'style.css']
-
-  for (const p of cssCandidates) {
+  // 2) 回退到根目录 css 文件
+  for (const p of ['theme.css', 'style.css']) {
     r = await fetchFromBranches(g, p, branches)
     if (r) {
       return await installTheme({
@@ -744,7 +762,145 @@ async function installFromGithub(input) {
     }
   }
 
-  throw new Error('未在仓库中找到 theme.json / theme.css / style.css')
+  // 3) 根目录无主题文件，尝试发现子目录中的主题并批量安装
+  const discovered = await discoverGithubThemes(g, branches)
+  if (discovered && discovered.themes.length > 0) {
+    const names = discovered.themes.map(t => '  · ' + t.name)
+    const ok = await CTX.ui.confirm(
+      '在仓库中发现 ' + discovered.themes.length + ' 个主题，是否全部安装？\n' + names.join('\n')
+    )
+    if (!ok) return null
+
+    let lastInstalled = null
+    for (const theme of discovered.themes) {
+      try {
+        lastInstalled = await installTheme({
+          rawCss: theme.css,
+          manifest: theme.manifest,
+          sourceLabel: 'github:' + g.owner + '/' + g.repo + '@' + discovered.branch + '/' + theme.path,
+        })
+        if (lastInstalled) CTX.ui.notice('已安装：' + lastInstalled.name, 'ok')
+      } catch (e) {
+        CTX.ui.notice('跳过 ' + theme.name + '：' + (e.message || String(e)), 'err', 3000)
+      }
+    }
+    return lastInstalled
+  }
+
+  throw new Error('未在仓库中找到 theme.json / theme.css / style.css，也未发现子目录主题')
+}
+
+// 从 GitHub 仓库的指定子路径安装单个主题
+async function installFromGithubPath(g, branches) {
+  const path = g.path.replace(/\/$/, '')
+
+  // 如果 path 直接指向文件
+  if (/\.json($|\?)/i.test(path)) {
+    const r = await fetchFromBranches(g, path, branches)
+    if (r) {
+      let manifest
+      try { manifest = JSON.parse(r.text) } catch (e) { throw new Error('theme.json 解析失败：' + e.message) }
+      const dir = path.replace(/[^/]*$/, '')
+      const mainRel = manifest.main || 'style.css'
+      const cssUrl = rawUrl(g, dir + mainRel, r.branch)
+      const cssText = await fetchText(cssUrl)
+      return await installTheme({
+        rawCss: cssText, manifest,
+        sourceLabel: 'github:' + g.owner + '/' + g.repo + '@' + r.branch + '/' + path,
+      })
+    }
+  }
+  if (/\.css($|\?)/i.test(path)) {
+    const r = await fetchFromBranches(g, path, branches)
+    if (r) {
+      return await installTheme({
+        rawCss: r.text,
+        sourceLabel: 'github:' + g.owner + '/' + g.repo + '@' + r.branch + '/' + path,
+      })
+    }
+  }
+
+  // path 是子目录：在其中查找主题文件
+  let r = await fetchFromBranches(g, path + '/theme.json', branches)
+  if (r) {
+    let manifest
+    try { manifest = JSON.parse(r.text) } catch (e) { throw new Error('theme.json 解析失败：' + e.message) }
+    const mainRel = manifest.main || 'style.css'
+    const cssUrl = rawUrl(g, path + '/' + mainRel, r.branch)
+    const cssText = await fetchText(cssUrl)
+    return await installTheme({
+      rawCss: cssText, manifest,
+      sourceLabel: 'github:' + g.owner + '/' + g.repo + '@' + r.branch + '/' + path,
+    })
+  }
+
+  for (const cssName of ['theme.css', 'style.css']) {
+    r = await fetchFromBranches(g, path + '/' + cssName, branches)
+    if (r) {
+      return await installTheme({
+        rawCss: r.text,
+        sourceLabel: 'github:' + g.owner + '/' + g.repo + '@' + r.branch + '/' + path + '/' + cssName,
+      })
+    }
+  }
+
+  throw new Error('未在 ' + path + '/ 中找到 theme.json / theme.css / style.css')
+}
+
+// 用 GitHub Contents API 发现仓库中子目录里的主题
+async function discoverGithubThemes(g, branches) {
+  for (const branch of branches) {
+    const apiUrl = 'https://api.github.com/repos/' + g.owner + '/' + g.repo + '/contents/?ref=' + branch
+    const listText = await fetchTextOrNull(apiUrl)
+    if (!listText) continue
+
+    let items
+    try { items = JSON.parse(listText) } catch { continue }
+    if (!Array.isArray(items)) continue
+
+    const dirs = items.filter(i => i.type === 'dir')
+    if (dirs.length === 0) continue
+
+    const themes = []
+    for (const dir of dirs) {
+      const jsonUrl = rawUrl(g, dir.name + '/theme.json', branch)
+      const jsonText = await fetchTextOrNull(jsonUrl)
+      if (jsonText) {
+        let manifest
+        try { manifest = JSON.parse(jsonText) } catch { continue }
+        const mainRel = manifest.main || 'style.css'
+        const cssUrl = rawUrl(g, dir.name + '/' + mainRel, branch)
+        const cssText = await fetchTextOrNull(cssUrl)
+        if (cssText) {
+          themes.push({
+            name: manifest.name || manifest.id || dir.name,
+            path: dir.name,
+            manifest,
+            css: cssText,
+          })
+        }
+        continue
+      }
+      // 没有 theme.json，尝试 css 文件
+      for (const cssName of ['theme.css', 'style.css']) {
+        const cssUrl = rawUrl(g, dir.name + '/' + cssName, branch)
+        const cssText = await fetchTextOrNull(cssUrl)
+        if (cssText) {
+          const meta = parseCssMeta(cssText)
+          themes.push({
+            name: meta.name || dir.name,
+            path: dir.name,
+            manifest: meta.id ? meta : null,
+            css: cssText,
+          })
+          break
+        }
+      }
+    }
+
+    if (themes.length > 0) return { themes, branch }
+  }
+  return null
 }
 
 async function copyThemeAssets(sourceDir, themeId) {
