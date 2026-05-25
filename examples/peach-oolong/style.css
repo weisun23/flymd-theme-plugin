@@ -1,0 +1,55 @@
+/* peach-oolong: 暖色调浅色主题 */
+
+.container {
+  --bg: #fff7f0;
+  --fg: #4a2c2a;
+  --code-bg: #ffe8d6;
+  --code-border: #f4a261;
+  --code-fg: #4a2c2a;
+  --c-key: #c2410c;
+  --c-str: #2563eb;
+  --c-num: #b91c1c;
+  --c-fn: #7c3aed;
+  --c-com: #9c8a78;
+}
+
+.container .preview {
+  --preview-bg: #fdf6ec;
+}
+
+.container.wysiwyg-v2 {
+  --wysiwyg-bg: #fdf6ec;
+}
+
+.container .preview h1,
+.container.wysiwyg-v2 .ProseMirror h1 {
+  color: #c2410c;
+  border-bottom-color: rgba(194, 65, 12, 0.2);
+}
+
+.container .preview h2,
+.container.wysiwyg-v2 .ProseMirror h2 {
+  color: #ea580c;
+}
+
+.container .preview blockquote {
+  border-left-color: #f4a261;
+  background: rgba(244, 162, 97, 0.1);
+  color: #5a3a32;
+}
+
+.container .preview a,
+.container.wysiwyg-v2 .ProseMirror a {
+  color: #c2410c;
+  text-decoration-color: rgba(194, 65, 12, 0.3);
+}
+
+.container .preview table,
+.container.wysiwyg-v2 .ProseMirror table {
+  border-color: #f4a261;
+}
+
+.container .preview table th,
+.container.wysiwyg-v2 .ProseMirror table th {
+  background: #ffe8d6;
+}

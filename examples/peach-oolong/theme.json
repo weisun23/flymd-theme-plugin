@@ -1,0 +1,8 @@
+{
+  "id": "peach-oolong",
+  "name": "蜜桃乌龙",
+  "version": "1.0.0",
+  "author": "flymd-theme-plugin",
+  "description": "暖色调浅色主题，适合长时间阅读",
+  "main": "style.css"
+}
