@@ -3,13 +3,13 @@
   "name": "主题管理器",
   "version": "0.1.0",
   "author": "flymd-theme-plugin",
-  "description": "从 URL、GitHub 仓库或本地文件导入主题，安装到 flymd 数据目录，并通过下拉菜单切换生效。",
+  "description": "从 URL、GitHub 仓库或本地文件导入主题，安装到 flymd 数据目录，并通过下拉菜单切换生效。[主页](https://github.com/weisun23/flymd-theme-plugin)",
   "i18n": {
     "en": {
       "name": "Theme Manager",
-      "description": "Import themes from URL, GitHub or local files; install to flymd data dir and switch via menu."
+      "description": "Import themes from URL, GitHub or local files; install to flymd data dir and switch via menu. [Homepage](https://github.com/weisun23/flymd-theme-plugin)"
     }
   },
-  "homepage": "https://github.com/flyhunterl/flymd",
+  "homepage": "https://github.com/weisun23/flymd-theme-plugin",
   "main": "main.js"
 }
