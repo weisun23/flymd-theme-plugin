@@ -178,6 +178,29 @@ async function fetchTextOrNull(url) {
   }
 }
 
+// 同时返回 HTTP 状态，用于区分"找不到"与"被限流"
+async function fetchTextWithStatus(url) {
+  try {
+    if (!CTX || !CTX.http) return { text: null, status: 0, error: 'http API 不可用' }
+    const resp = await CTX.http.fetch(url, { method: 'GET' })
+    if (!resp) return { text: null, status: 0, error: 'no response' }
+    const status = resp.status || resp.statusCode || 0
+    const ok = resp.ok !== undefined ? resp.ok : (status >= 200 && status < 300)
+    if (!ok) return { text: null, status, error: 'HTTP ' + status }
+    let text = null
+    if (typeof resp.text === 'function') text = await resp.text()
+    else if (typeof resp.data === 'string') text = resp.data
+    else if (typeof resp.body === 'string') text = resp.body
+    else if (resp.data && (resp.data instanceof ArrayBuffer || (resp.data.buffer instanceof ArrayBuffer))) {
+      text = new TextDecoder('utf-8').decode(resp.data)
+    }
+    if (text == null) return { text: null, status, error: 'no text content' }
+    return { text, status, error: null }
+  } catch (e) {
+    return { text: null, status: 0, error: e && e.message ? e.message : String(e) }
+  }
+}
+
 // 在多个分支候选下尝试拉取一个相对路径
 async function fetchFromBranches(g, path, branches) {
   for (const b of branches) {
@@ -584,6 +607,7 @@ async function applyThemeById(id) {
     clearInjection()
     await saveCurrentId(null)
     cachedCurrentId = null
+    refreshMenuChecks()
     return
   }
   const idx = await loadIndex()
@@ -593,6 +617,7 @@ async function applyThemeById(id) {
     clearInjection()
     await saveCurrentId(null)
     cachedCurrentId = null
+    refreshMenuChecks()
     return
   }
   const cssPath = buildThemeCssPath(id)
@@ -602,6 +627,7 @@ async function applyThemeById(id) {
     clearInjection()
     await saveCurrentId(null)
     cachedCurrentId = null
+    refreshMenuChecks()
     return
   }
   let css = await readText(cssPath)
@@ -616,6 +642,7 @@ async function applyThemeById(id) {
   injectCss(id, css)
   await saveCurrentId(id)
   cachedCurrentId = id
+  refreshMenuChecks()
 }
 
 // ============================================================
@@ -772,22 +799,29 @@ async function installFromGithub(input) {
     if (!ok) return null
 
     let lastInstalled = null
+    let okCount = 0, failCount = 0
     for (const theme of discovered.themes) {
       try {
-        lastInstalled = await installTheme({
+        const installed = await installTheme({
           rawCss: theme.css,
           manifest: theme.manifest,
           sourceLabel: 'github:' + g.owner + '/' + g.repo + '@' + discovered.branch + '/' + theme.path,
         })
-        if (lastInstalled) CTX.ui.notice('已安装：' + lastInstalled.name, 'ok')
+        if (installed) {
+          lastInstalled = installed
+          okCount++
+          CTX.ui.notice('已安装：' + installed.name, 'ok', 1500)
+        }
       } catch (e) {
+        failCount++
         CTX.ui.notice('跳过 ' + theme.name + '：' + (e.message || String(e)), 'err', 3000)
       }
     }
+    CTX.ui.notice('批量安装完成：' + okCount + ' 成功 / ' + failCount + ' 失败', okCount > 0 ? 'ok' : 'err', 4000)
     return lastInstalled
   }
 
-  throw new Error('未在仓库中找到 theme.json / theme.css / style.css，也未发现子目录主题')
+  throw new Error('未在仓库中找到 theme.json / theme.css / style.css，也未发现子目录主题。如果仓库主题较多，可能是 GitHub API 临时限流，请稍后重试，或直接输入 owner/repo/子目录 安装单个主题。')
 }
 
 // 从 GitHub 仓库的指定子路径安装单个主题
@@ -848,59 +882,156 @@ async function installFromGithubPath(g, branches) {
 }
 
 // 用 GitHub Contents API 发现仓库中子目录里的主题
+//
+// 优化策略：
+//   1) 优先用 git/trees?recursive=1 一次拿到整棵树（成本=1 次 API 调用）
+//      这样能避开"对每个子目录都单独调 contents API"导致的 60/小时限流。
+//   2) 落不下来再退回 contents API 列根目录 + 逐个目录探测。
+//   3) 任何一步检测到 403 + "rate limit" 立刻向用户抛明确错误，而不是兜底为
+//      "未在仓库中找到主题"，避免把限流问题误诊为仓库结构问题。
 async function discoverGithubThemes(g, branches) {
   for (const branch of branches) {
-    const apiUrl = 'https://api.github.com/repos/' + g.owner + '/' + g.repo + '/contents/?ref=' + branch
-    const listText = await fetchTextOrNull(apiUrl)
-    if (!listText) continue
-
-    let items
-    try { items = JSON.parse(listText) } catch { continue }
-    if (!Array.isArray(items)) continue
-
-    const dirs = items.filter(i => i.type === 'dir')
-    if (dirs.length === 0) continue
-
-    const themes = []
-    for (const dir of dirs) {
-      const jsonUrl = rawUrl(g, dir.name + '/theme.json', branch)
-      const jsonText = await fetchTextOrNull(jsonUrl)
-      if (jsonText) {
-        let manifest
-        try { manifest = JSON.parse(jsonText) } catch { continue }
-        const mainRel = manifest.main || 'style.css'
-        const cssUrl = rawUrl(g, dir.name + '/' + mainRel, branch)
-        const cssText = await fetchTextOrNull(cssUrl)
-        if (cssText) {
-          themes.push({
-            name: manifest.name || manifest.id || dir.name,
-            path: dir.name,
-            manifest,
-            css: cssText,
-          })
-        }
-        continue
-      }
-      // 没有 theme.json，尝试 css 文件
-      for (const cssName of ['theme.css', 'style.css']) {
-        const cssUrl = rawUrl(g, dir.name + '/' + cssName, branch)
-        const cssText = await fetchTextOrNull(cssUrl)
-        if (cssText) {
-          const meta = parseCssMeta(cssText)
-          themes.push({
-            name: meta.name || dir.name,
-            path: dir.name,
-            manifest: meta.id ? meta : null,
-            css: cssText,
-          })
-          break
-        }
-      }
+    // 先用 trees API 一次性列出所有文件
+    const treeResult = await fetchGithubTree(g, branch)
+    if (treeResult && treeResult.themes !== undefined) {
+      return treeResult
+    }
+    if (treeResult && treeResult.rateLimited) {
+      throw new Error('GitHub API 调用次数已达上限（每小时 60 次未鉴权请求）。请稍后再试，或直接输入 owner/repo/子目录 来安装单个主题。')
     }
 
+    // 退回到 contents API
+    const apiUrl = 'https://api.github.com/repos/' + g.owner + '/' + g.repo + '/contents/?ref=' + branch
+    const r = await fetchTextWithStatus(apiUrl)
+    if (r.status === 403 && r.text == null) {
+      throw new Error('GitHub API 被限流（HTTP 403）。请稍后再试，或直接输入 owner/repo/子目录 安装单个主题。')
+    }
+    if (r.text == null) continue
+
+    let items
+    try { items = JSON.parse(r.text) } catch { continue }
+    if (Array.isArray(items) && items.length > 0 && items[0].message && /rate limit/i.test(items[0].message)) {
+      throw new Error('GitHub API 被限流：' + items[0].message)
+    }
+    if (!Array.isArray(items)) continue
+
+    const dirs = items.filter(i => i.type === 'dir' && !i.name.startsWith('.'))
+    if (dirs.length === 0) continue
+
+    // 并发拉取所有子目录的主题文件
+    const results = await Promise.all(dirs.map(d => probeThemeDir(g, branch, d.name)))
+    const themes = results.filter(t => t)
     if (themes.length > 0) return { themes, branch }
   }
   return null
+}
+
+// 探测单个子目录是否包含主题文件，返回 theme 对象或 null
+async function probeThemeDir(g, branch, dirName) {
+  const jsonUrl = rawUrl(g, dirName + '/theme.json', branch)
+  const jsonText = await fetchTextOrNull(jsonUrl)
+  if (jsonText) {
+    let manifest
+    try { manifest = JSON.parse(jsonText) } catch { return null }
+    const mainRel = manifest.main || 'style.css'
+    const cssUrl = rawUrl(g, dirName + '/' + mainRel, branch)
+    const cssText = await fetchTextOrNull(cssUrl)
+    if (cssText) {
+      return {
+        name: manifest.name || manifest.id || dirName,
+        path: dirName,
+        manifest,
+        css: cssText,
+      }
+    }
+    return null
+  }
+  // 没有 theme.json，尝试 css 文件
+  for (const cssName of ['theme.css', 'style.css']) {
+    const cssUrl = rawUrl(g, dirName + '/' + cssName, branch)
+    const cssText = await fetchTextOrNull(cssUrl)
+    if (cssText) {
+      const meta = parseCssMeta(cssText)
+      return {
+        name: meta.name || dirName,
+        path: dirName,
+        manifest: meta.id ? meta : null,
+        css: cssText,
+      }
+    }
+  }
+  return null
+}
+
+// 用一次 git/trees 调用拿到整个仓库的文件列表，按子目录归类后并发抓 raw 文件
+// 返回：{ themes, branch } 成功 / { rateLimited: true } 限流 / null 不可用
+async function fetchGithubTree(g, branch) {
+  const url = 'https://api.github.com/repos/' + g.owner + '/' + g.repo + '/git/trees/' + branch + '?recursive=1'
+  const r = await fetchTextWithStatus(url)
+  if (r.status === 403) return { rateLimited: true }
+  if (r.text == null) return null
+
+  let parsed
+  try { parsed = JSON.parse(r.text) } catch { return null }
+  if (parsed && parsed.message && /rate limit/i.test(parsed.message)) return { rateLimited: true }
+  if (!parsed || !Array.isArray(parsed.tree)) return null
+
+  // 按"顶层目录"归类文件
+  const dirFiles = new Map() // dirName -> Set<relPath>
+  for (const node of parsed.tree) {
+    if (node.type !== 'blob' || typeof node.path !== 'string') continue
+    const slashIdx = node.path.indexOf('/')
+    if (slashIdx <= 0) continue
+    const dirName = node.path.slice(0, slashIdx)
+    if (dirName.startsWith('.')) continue
+    const fileName = node.path.slice(slashIdx + 1)
+    if (!dirFiles.has(dirName)) dirFiles.set(dirName, new Set())
+    dirFiles.get(dirName).add(fileName)
+  }
+
+  // 筛出包含主题文件的目录
+  const candidates = []
+  for (const [dirName, files] of dirFiles) {
+    if (files.has('theme.json')) {
+      candidates.push({ dirName, type: 'json', file: 'theme.json' })
+    } else if (files.has('theme.css')) {
+      candidates.push({ dirName, type: 'css', file: 'theme.css' })
+    } else if (files.has('style.css')) {
+      candidates.push({ dirName, type: 'css', file: 'style.css' })
+    }
+  }
+  if (candidates.length === 0) return null
+
+  // 并发拉取候选目录的主题文件（直接走 raw.githubusercontent.com，不再消耗 API 配额）
+  const themes = (await Promise.all(candidates.map(async (c) => {
+    if (c.type === 'json') {
+      const jsonText = await fetchTextOrNull(rawUrl(g, c.dirName + '/' + c.file, branch))
+      if (!jsonText) return null
+      let manifest
+      try { manifest = JSON.parse(jsonText) } catch { return null }
+      const mainRel = manifest.main || 'style.css'
+      const cssText = await fetchTextOrNull(rawUrl(g, c.dirName + '/' + mainRel, branch))
+      if (!cssText) return null
+      return {
+        name: manifest.name || manifest.id || c.dirName,
+        path: c.dirName,
+        manifest,
+        css: cssText,
+      }
+    }
+    const cssText = await fetchTextOrNull(rawUrl(g, c.dirName + '/' + c.file, branch))
+    if (!cssText) return null
+    const meta = parseCssMeta(cssText)
+    return {
+      name: meta.name || c.dirName,
+      path: c.dirName,
+      manifest: meta.id ? meta : null,
+      css: cssText,
+    }
+  }))).filter(t => t)
+
+  if (themes.length === 0) return null
+  return { themes, branch }
 }
 
 async function copyThemeAssets(sourceDir, themeId) {
@@ -1273,12 +1404,10 @@ async function syncMenuThemeItems(container) {
 
   const DEFAULT_LABEL = '默认（无自定义主题）'
 
-  // 找到所有可点击的菜单项元素
-  const allItems = container.querySelectorAll('[class*="item"], [role="menuitem"], li, div')
-  let itemEls = []
+  // 文本节点 -> 元素映射，用于定位"默认"项
+  const textToEl = new Map()
   const tw = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null)
   let tn
-  const textToEl = new Map()
   while ((tn = tw.nextNode())) {
     const nv = (tn.nodeValue || '').trim().replace(/ ✓$/, '')
     if (!nv) continue
@@ -1286,11 +1415,10 @@ async function syncMenuThemeItems(container) {
     if (el && !textToEl.has(nv)) textToEl.set(nv, el)
   }
 
-  // 找到"默认"项的容器元素（作为模板和定位锚点）
   const defaultEl = textToEl.get(DEFAULT_LABEL)
   if (!defaultEl) return
 
-  // 获取菜单项的容器层级：向上找到最近的包含多个兄弟的父元素
+  // 向上找到菜单项的容器节点（含多个兄弟的层级）
   let itemNode = defaultEl
   while (itemNode.parentElement && itemNode.parentElement !== container) {
     const siblings = itemNode.parentElement.children
@@ -1300,67 +1428,95 @@ async function syncMenuThemeItems(container) {
   const itemParent = itemNode.parentElement
   if (!itemParent) return
 
-  // 收集当前 DOM 中的主题项（从"默认"之后到第一个分割线之前）
-  const existingItems = []
+  // 收集"默认"之后到第一个分割线/安装组之前的现有主题项
+  const themeAreaItems = []
   let foundDefault = false
   for (const child of Array.from(itemParent.children)) {
-    if (child === itemNode || child.contains(defaultEl)) { foundDefault = true; continue }
+    if (child === itemNode) { foundDefault = true; continue }
     if (!foundDefault) continue
+    const isDivider = child.querySelector('hr, [class*="divider"], [class*="separator"]') || child.getAttribute('role') === 'separator'
+    if (isDivider) break
     const childText = (child.textContent || '').trim()
-    if (!childText || child.querySelector('hr, [class*="divider"], [class*="separator"]') || child.getAttribute('role') === 'separator') break
-    if (childText === '安装' || childText.startsWith('来自')) break
-    existingItems.push(child)
+    if (!childText || childText === '安装' || childText.startsWith('来自')) break
+    themeAreaItems.push(child)
   }
 
-  // 计算需要添加和删除的主题
-  const existingLabels = new Set(existingItems.map(el => (el.textContent || '').trim().replace(/ ✓$/, '').replace(/v[\d.]+$/, '').trim()))
-  const wantedLabels = new Map(ids.map(id => [(idx[id].name || id), id]))
+  // 用"默认"项作为模板克隆出我们自己的菜单项
+  // 关键点：克隆体没有 flymd 的事件监听，由我们挂自己的处理函数 +
+  // stopImmediatePropagation 阻止菜单关闭，从而支持连续切换主题
+  const template = itemNode.cloneNode(true)
+  cleanCheckMark(template)
 
-  // 删除不存在的主题项
-  for (const el of existingItems) {
-    const label = (el.textContent || '').trim().replace(/ ✓$/, '').replace(/v[\d.]+$/, '').trim()
-    if (!wantedLabels.has(label)) {
-      el.remove()
-    }
-  }
+  const newDefault = makeOwnedMenuItem(template, DEFAULT_LABEL, async () => {
+    await applyThemeById(null)
+    if (CTX && CTX.ui) CTX.ui.notice('已切换到默认主题', 'ok')
+  })
+  itemParent.replaceChild(newDefault, itemNode)
 
-  // 添加新主题项
-  let insertAfter = itemNode
-  for (const child of Array.from(itemParent.children)) {
-    if (child === itemNode || child.contains(defaultEl)) { insertAfter = child; continue }
-    const ct = (child.textContent || '').trim().replace(/ ✓$/, '').replace(/v[\d.]+$/, '').trim()
-    if (wantedLabels.has(ct)) { insertAfter = child; continue }
-    break
-  }
+  for (const el of themeAreaItems) el.remove()
 
+  let insertAfter = newDefault
   for (const id of ids) {
     const name = idx[id].name || id
-    if (existingLabels.has(name)) continue
-    const newItem = itemNode.cloneNode(true)
-    // 替换文本内容
-    const ntw = document.createTreeWalker(newItem, NodeFilter.SHOW_TEXT, null)
-    let firstText = null
-    while ((firstText = ntw.nextNode())) {
-      if ((firstText.nodeValue || '').trim()) { firstText.nodeValue = name; break }
-    }
-    // 添加点击事件
-    newItem.style.cursor = 'pointer'
-    newItem.addEventListener('click', async (e) => {
-      e.stopPropagation()
+    const newItem = makeOwnedMenuItem(template, name, async () => {
       try {
         await applyThemeById(id)
-        CTX.ui.notice('已应用：' + name, 'ok')
-      } catch (err) {
-        CTX.ui.notice('应用失败：' + (err.message || String(err)), 'err')
+        if (CTX && CTX.ui) CTX.ui.notice('已应用：' + name, 'ok')
+      } catch (e) {
+        if (CTX && CTX.ui) CTX.ui.notice('应用失败：' + (e.message || String(e)), 'err')
       }
     })
     insertAfter.after(newItem)
     insertAfter = newItem
   }
 
-  // 给当前主题打 ✓
   const targetLabel = (cur && idx[cur]) ? (idx[cur].name || cur) : DEFAULT_LABEL
   markMenuItemByLabel(container, targetLabel)
+}
+
+function cleanCheckMark(el) {
+  if (!el) return
+  el.removeAttribute(CHECKED_ATTR)
+  const tw = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null)
+  let tn
+  while ((tn = tw.nextNode())) {
+    if (/ ✓$/.test(tn.nodeValue || '')) {
+      tn.nodeValue = tn.nodeValue.replace(/ ✓$/, '')
+    }
+  }
+}
+
+// 用模板克隆出一个完全由我们控制的菜单项：
+//   - 替换首个非空文本节点为指定 label
+//   - 用 mousedown.preventDefault + click capturing + stopImmediatePropagation
+//     阻断 flymd 菜单组件的"点完即关"逻辑
+function makeOwnedMenuItem(template, label, handler) {
+  const el = template.cloneNode(true)
+  cleanCheckMark(el)
+  const tw = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null)
+  let tn
+  while ((tn = tw.nextNode())) {
+    if ((tn.nodeValue || '').trim()) {
+      tn.nodeValue = label
+      break
+    }
+  }
+  el.style.cursor = 'pointer'
+  el.addEventListener('mousedown', (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+  }, true)
+  el.addEventListener('click', async (e) => {
+    e.stopPropagation()
+    e.stopImmediatePropagation()
+    e.preventDefault()
+    try {
+      await handler()
+    } catch (err) {
+      console.warn('[theme-manager] menu item click failed:', err)
+    }
+  }, true)
+  return el
 }
 
 function markMenuItemByLabel(container, label) {
@@ -1383,6 +1539,41 @@ function markMenuItemByLabel(container, label) {
     parent.setAttribute(CHECKED_ATTR, '1')
     return
   }
+}
+
+// 切换主题后调用：扫所有已挂载的菜单弹层，清除旧 ✓ 重打到当前主题项。
+// 解决"菜单展开状态下连续切换主题，✓ 不更新"的问题。
+function refreshMenuChecks() {
+  const roots = document.querySelectorAll('[' + MARKED_ATTR + '="1"]')
+  if (!roots.length) return
+
+  ;(async () => {
+    try {
+      const idx = await loadIndex()
+      const cur = cachedCurrentId
+      const targetLabel = (cur && idx[cur]) ? (idx[cur].name || cur) : '默认（无自定义主题）'
+
+      for (const root of roots) {
+        if (!document.body.contains(root)) continue
+        // 清除旧 ✓ 标记
+        const checkedEls = root.querySelectorAll('[' + CHECKED_ATTR + '="1"]')
+        for (const el of checkedEls) {
+          el.removeAttribute(CHECKED_ATTR)
+          const tw = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null)
+          let tn
+          while ((tn = tw.nextNode())) {
+            const nv = tn.nodeValue || ''
+            if (/ ✓$/.test(nv)) {
+              tn.nodeValue = nv.replace(/ ✓$/, '')
+            }
+          }
+        }
+        markMenuItemByLabel(root, targetLabel)
+      }
+    } catch (e) {
+      console.warn('[theme-manager] refreshMenuChecks failed:', e)
+    }
+  })()
 }
 
 async function rebuildMenu() {
